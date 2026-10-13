@@ -1,0 +1,81 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # 04:17 Asia/Shanghai (20:17 UTC on the previous day).
+    - cron: '17 20 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'GODchunyu/rea-rea'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Merge upstream and keep the schedule active
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const upstreamOwner = 'morluto';
+            const upstreamRepo = 'rea';
+            const { data: target } = await github.rest.repos.get({ owner, repo });
+            if (!target.fork || target.parent?.full_name !== `${upstreamOwner}/${upstreamRepo}`) {
+              throw new Error('Repository is no longer a fork of the configured upstream.');
+            }
+            const branch = target.default_branch;
+            const { data: upstream } = await github.rest.repos.get({
+              owner: upstreamOwner, repo: upstreamRepo
+            });
+            if (branch !== upstream.default_branch) {
+              throw new Error('Default branch names differ; review the sync configuration.');
+            }
+            try {
+              const { data: result } = await github.rest.repos.mergeUpstream({ owner, repo, branch });
+              core.info(result.message ?? 'Upstream sync completed.');
+              await core.summary.addHeading('Upstream sync')
+                .addRaw(`${upstreamOwner}/${upstreamRepo}:${branch} → ${owner}/${repo}:${branch}`)
+                .addBreak().addRaw(result.message ?? 'Up to date.').write();
+            } catch (error) {
+              if (error.status === 409 || error.status === 422) {
+                core.setFailed('Upstream could not be merged. Resolve the conflict or branch restriction manually; no force push was performed.');
+                return;
+              }
+              throw error;
+            }
+
+            // GitHub disables public scheduled workflows after 60 days of repository
+            // inactivity. An occasional metadata commit keeps this schedule active.
+            const { data: latest } = await github.rest.repos.getCommit({ owner, repo, ref: branch });
+            const lastCommitTime = Date.parse(latest.commit.committer.date);
+            if (!Number.isFinite(lastCommitTime)) throw new Error('Invalid last commit timestamp.');
+            if (Date.now() - lastCommitTime >= 40 * 24 * 60 * 60 * 1000) {
+              const path = '.github/upstream-sync-state.json';
+              let sha;
+              try {
+                const { data: existing } = await github.rest.repos.getContent({ owner, repo, path, ref: branch });
+                if (Array.isArray(existing) || existing.type !== 'file') {
+                  throw new Error('Sync state path is not a file.');
+                }
+                sha = existing.sha;
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+              const content = JSON.stringify({
+                upstream: `${upstreamOwner}/${upstreamRepo}`,
+                lastKeepalive: new Date().toISOString()
+              }, null, 2) + '\n';
+              await github.rest.repos.createOrUpdateFileContents({
+                owner, repo, branch, path, sha,
+                message: 'chore: keep daily upstream sync active',
+                content: Buffer.from(content).toString('base64')
+              });
+              core.info('Created a keepalive commit for the scheduled workflow.');
+            }
